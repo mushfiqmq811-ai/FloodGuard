@@ -1,0 +1,4 @@
+Email configuration notes:
+- Validate SMTP credentials.
+- Ensure sender configuration matches the mail provider.
+- Use secure keys and avoid sharing secrets in source control.

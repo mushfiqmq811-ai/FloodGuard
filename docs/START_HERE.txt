@@ -1,0 +1,7 @@
+FloodGuard
+==========
+
+Getting started:
+1. Install dependencies from requirements.txt
+2. Run the app using python src/app.py or the Windows run.bat script.
+3. Open the generated local page in a browser.

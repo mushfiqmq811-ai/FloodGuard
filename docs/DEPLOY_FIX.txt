@@ -1,0 +1,4 @@
+Deployment notes:
+- Confirm correct environment variables are configured.
+- Ensure the app starts with a proper web server entry point.
+- Check logs if the service fails to bind to the port.

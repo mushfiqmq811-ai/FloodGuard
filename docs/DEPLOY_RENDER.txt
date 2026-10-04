@@ -1,0 +1,4 @@
+Render deployment notes:
+- Use the service command defined in the deployment setup file.
+- Keep Python requirements up to date.
+- Verify environment variables and domain settings.
