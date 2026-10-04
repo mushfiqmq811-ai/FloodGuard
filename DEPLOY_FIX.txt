@@ -1,0 +1,7 @@
+RENDER FIX
+
+The previous deployment failed because Render could not find templates/index.html.
+This version also places index.html at the repository root and configures Flask to load it from there.
+
+For GitHub: replace the existing repository files with the contents of this package, keeping the file structure.
+Render will auto-deploy after the commit.

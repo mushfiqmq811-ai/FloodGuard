@@ -1,0 +1,17 @@
+FLOODGUARD BD — PUBLIC WEBSITE DEPLOYMENT
+
+This package is prepared for Render.
+
+1. Create a GitHub account and a new PUBLIC repository named floodguard-bd.
+2. Upload ALL files/folders in this package to the repository root.
+3. On Render: New + > Web Service > connect the GitHub repository.
+4. Build Command: pip install -r requirements.txt
+5. Start Command: gunicorn app:app
+6. Deploy. Render will give you a public https://...onrender.com URL.
+7. Open the URL from any phone, laptop, or other device.
+
+Optional custom domain:
+Buy a domain later and add it from Render.
+
+IMPORTANT:
+The dashboard should label source status accurately. Do not describe fallback/reference data as FFWC live data.

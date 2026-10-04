@@ -1,0 +1,14 @@
+FloodGuard BD — Google Apps Script email setup
+
+The app is preconfigured with the Web App URL created for this project.
+For Render, you can optionally set:
+  FLOODGUARD_EMAIL_WEBAPP_URL=<your Apps Script /exec URL>
+
+The app sends:
+1) one welcome email after alerts are enabled,
+2) one email when the user's zone risk level actually changes,
+3) one daily summary per calendar day,
+4) a manual test email from My account & alerts.
+
+Keep the Apps Script deployed as a Web app, Execute as: Me, Who has access: Anyone.
+Do not put Google passwords or secrets in the website code.
