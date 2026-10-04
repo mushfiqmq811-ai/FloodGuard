@@ -1,7 +1,16 @@
 services:
   - type: web
-    name: floodguard-bd
+    name: floodguard
     env: python
+    region: singapore
+    plan: free
+    pythonVersion: 3.11
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
-    autoDeploy: true
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: PORT
+        value: 5081
+      - key: SECRET_KEY
+        generateValue: true
