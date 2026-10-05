@@ -1,39 +1,28 @@
-# FloodGuard BD — Professional Dashboard
+# FloodGuard BD — Real-Data Production Build
 
-Public-facing Bangladesh flood intelligence dashboard built with Flask.
+This build keeps the existing FloodGuard BD interface and replaces the previous simulated/demo data path with an authentic-source pipeline.
 
-## Run locally
-1. Install Python 3.11+.
-2. Open a terminal in this folder.
-3. Run `python -m pip install -r requirements.txt`.
-4. Run `python app.py`.
-5. Open the URL shown by Flask (Render uses `$PORT`; locally the app defaults to 5081).
+## Data sources
+- **BWDB Hydrology chart pages:** observed water levels are fetched from the official BWDB Hydrology website. The station availability report is used to map FloodGuard zones to published BWDB stations; chart pages are then parsed for observed timestamp/level records.
+- **Copernicus GloFAS / EWDS:** operational forecast access uses the current EWDS API base URL `https://ewds.climate.copernicus.eu/api` and a server-side personal access token.
+- **Model:** the production model is trained only from authentic BWDB observed water-level history. If insufficient real observations are available, training aborts; it never fabricates rows.
+- **Gemini:** optional AI Copilot uses `GEMINI_API_KEY` and is instructed to ground answers only in FloodGuard source data.
+- **Notifications:** SMTP email and browser Web Push are supported.
 
-## Render
-Build command:
-`pip install -r requirements.txt`
+## Important behavior
+There is no synthetic-data fallback in the production data path. If an authentic source cannot be fetched, the affected zone reports `DATA UNAVAILABLE` and the model does not invent a prediction.
 
-Start command:
-`gunicorn --bind 0.0.0.0:$PORT app:app`
+## Local / Render
+Install dependencies, configure the environment variables in `DEPLOY_RENDER.txt`, then run:
 
-The homepage is served from the root `index.html` so the deployment does not depend on a `templates/` copy.
+```bash
+python train_real_model.py
+```
 
-## Notes
-- The public dashboard works without login.
-- Login is optional and is for saved preferences and future notification delivery.
-- Observed/source data, forecast/reference data, and AI projections are kept distinct in the UI.
-- Long-range forecasts are experimental and uncertain; official authorities remain the emergency decision source.
+The training script performs a chronological holdout evaluation and writes the real-data-trained model to `model/real_flood_model.joblib` plus metadata. Generated model artifacts are ignored by Git until explicitly added.
 
+Run the web app with:
 
-ALERT CONFIGURATION
-- Website is login-optional.
-- Users can save a preferred zone, language, WhatsApp number, and alert choices.
-- One welcome alert, one daily alert, and one alert per daily risk-state change are tracked per user.
-- Email delivery uses SMTP environment variables: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM.
-- WhatsApp delivery uses Twilio environment variables: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM.
-- `/api/alerts/dispatch` can be called by an external cron for reliable scheduled delivery.
-
-
-## v5091 performance pass
-
-Reduced expensive continuous effects, removed the blocking transition overlay, deferred large hidden-page work, and reduced repeated DOM/animation work for smoother scrolling and navigation.
+```bash
+gunicorn --bind 0.0.0.0:$PORT app:app
+```

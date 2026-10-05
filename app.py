@@ -1,25 +1,16 @@
 from flask import Flask, render_template, jsonify, request, Response, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
-import math, random, threading, time, statistics, os, sqlite3, re, smtplib, urllib.parse, json
+import math, threading, time, statistics, os, sqlite3, re, smtplib, urllib.parse, json
 from live_data import fetch_ffwc_current
+from model import predict_flood, model_status
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, 'floodguard.db')
 app = Flask(__name__, template_folder='.', static_folder='static')
 app.secret_key = os.environ.get('SECRET_KEY', 'floodguard-dev-secret-change-me')
 
-# User-provided Mymensingh readings retained as historical project observations.
-MYMENSINGH_REAL = [
-('2026-05-09 09:00:00',9.29),('2026-05-09 12:00:00',9.23),('2026-05-09 15:00:00',9.18),('2026-05-09 18:00:00',9.13),
-('2026-05-10 06:00:00',8.87),('2026-05-10 09:00:00',8.82),('2026-05-10 12:00:00',8.75),('2026-05-10 15:00:00',8.69),('2026-05-10 18:00:00',8.64),
-('2026-05-11 06:00:00',8.41),('2026-05-11 09:00:00',8.36),('2026-05-11 12:00:00',8.30),('2026-05-11 15:00:00',8.25),('2026-05-11 18:00:00',8.20),
-('2026-05-12 06:00:00',8.04),('2026-05-12 09:00:00',7.99),('2026-05-12 12:00:00',7.96),('2026-05-12 15:00:00',7.92),('2026-05-12 18:00:00',7.88),
-('2026-05-13 06:00:00',7.80),('2026-05-13 09:00:00',7.78),('2026-05-13 12:00:00',7.79),('2026-05-13 15:00:00',7.80),('2026-05-13 18:00:00',7.78),
-('2026-05-14 06:00:00',7.76),('2026-05-14 09:00:00',7.76),('2026-05-14 12:00:00',7.75),('2026-05-14 15:00:00',7.75),('2026-05-14 18:00:00',7.74),
-('2026-05-15 06:00:00',8.11),('2026-05-15 09:00:00',8.36),('2026-05-15 12:00:00',9.06),('2026-05-15 15:00:00',9.96),('2026-05-15 18:00:00',10.86),
-('2026-05-16 06:00:00',11.64),('2026-05-16 09:00:00',11.68)
-]
+# Historical observations are fetched from BWDB Hydrology at runtime. No embedded synthetic history is used.
 
 # Representative station set. Danger-level values are configuration references, not claims of current official measurements.
 STATIONS = {
@@ -45,11 +36,7 @@ STATIONS = {
  'feni': {'name':'Feni — Muhuri','district':'Feni','division':'Chattogram','river':'Muhuri','station':'Feni','danger':4.35,'lat':23.015,'lon':91.396,'seed':30,'base':3.45,'wave':0.11},
 }
 
-# Official bulletin snapshot values supplied in the chat. Never labelled as live.
-FFWC_BULLETIN_SNAPSHOT = {
-    'mymensingh': {'current': 6.32, 'danger': 12.05, 'observed_at': '2026-09-09 09:00', 'source': 'FFWC bulletin snapshot'},
-    'jamalpur': {'current': 12.14, 'danger': 16.55, 'observed_at': '2026-09-09 09:00', 'source': 'FFWC bulletin snapshot'},
-}
+# No embedded bulletin/snapshot fallback. Source data must be fetched authentically.
 
 LIVE_CACHE = {'payload': None, 'expires': 0, 'error': None, 'state': 'idle', 'last_attempt': None}
 CACHE_SECONDS = int(os.environ.get('LIVE_REFRESH_SECONDS', '300'))
@@ -69,70 +56,49 @@ def init_db():
     if 'whatsapp_alerts' not in cols: con.execute('ALTER TABLE users ADD COLUMN whatsapp_alerts INTEGER DEFAULT 1')
     con.execute('CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, event_type TEXT NOT NULL, event_key TEXT NOT NULL, sent_at TEXT NOT NULL, UNIQUE(user_id,event_type,event_key))')
     con.execute('CREATE TABLE IF NOT EXISTS alert_state (user_id INTEGER PRIMARY KEY, last_risk TEXT, last_daily_date TEXT, welcome_sent INTEGER DEFAULT 0, updated_at TEXT NOT NULL)')
+    con.execute('CREATE TABLE IF NOT EXISTS push_subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
     con.commit(); con.close()
 
 init_db()
 
 # ---------- Notification engine ----------
-def _email_script_url():
-    return os.environ.get('FLOODGUARD_EMAIL_WEBAPP_URL', '').strip() or 'https://script.google.com/macros/s/AKfycbzZUhJCgthQPXjUbVY7DgspCln2QpANsVRlmF56ShtP0k2I9s1UkRjWy1L8prw7vx8P/exec'
-
-def _email_configured():
-    return bool(_email_script_url())
-
 def _smtp_configured():
     return bool(os.environ.get('SMTP_HOST') and os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASS') and os.environ.get('EMAIL_FROM'))
 
-def _whatsapp_bridge_configured():
-    return bool(_email_script_url())
+def _email_configured(): return _smtp_configured()
+def _whatsapp_bridge_configured(): return False
 
 def _send_email(to_email, subject, body):
-    # Primary path: Google Apps Script -> Gmail. Optional SMTP fallback remains available.
-    url=_email_script_url()
-    if url:
-        try:
-            import requests
-            r=requests.post(url, json={'action':'send_email','to':to_email,'subject':subject,'body':body}, timeout=20)
-            if 200 <= r.status_code < 300:
-                try:
-                    out=r.json()
-                    if out.get('ok'):
-                        return True, 'sent via Google Apps Script'
-                    return False, out.get('error','Google Apps Script rejected email')
-                except Exception:
-                    return True, 'sent via Google Apps Script'
-            return False, f'Email bridge HTTP {r.status_code}'
-        except Exception as exc:
-            if not _smtp_configured():
-                return False, f'Email bridge error: {exc}'
-    if _smtp_configured():
-        host=os.environ.get('SMTP_HOST'); port=int(os.environ.get('SMTP_PORT','587')); user=os.environ.get('SMTP_USER'); pw=os.environ.get('SMTP_PASS'); sender=os.environ.get('EMAIL_FROM')
+    if not _smtp_configured(): return False, 'SMTP email provider is not configured.'
+    try:
+        host=os.environ['SMTP_HOST']; port=int(os.environ.get('SMTP_PORT','587')); user=os.environ['SMTP_USER']; pw=os.environ['SMTP_PASS']; sender=os.environ['EMAIL_FROM']
         msg=f"From: {sender}\r\nTo: {to_email}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
-        try:
-            with smtplib.SMTP(host,port,timeout=15) as server:
-                server.starttls(); server.login(user,pw); server.sendmail(sender,[to_email],msg.encode('utf-8'))
-            return True, 'sent via SMTP'
-        except Exception as exc:
-            return False, str(exc)
-    return False, 'Email provider is not configured.'
+        with smtplib.SMTP(host,port,timeout=15) as server:
+            if os.environ.get('SMTP_TLS','true').lower()=='true': server.starttls()
+            server.login(user,pw); server.sendmail(sender,[to_email],msg.encode('utf-8'))
+        return True, 'sent via SMTP'
+    except Exception as exc: return False, str(exc)
 
 def _send_whatsapp(number, body):
-    # WhatsApp is sent through the same Google Apps Script bridge.
-    # The script holds the WhatsApp Cloud API credentials in Script Properties.
-    url=_email_script_url()
-    if not url: return False, 'WhatsApp bridge is not configured.'
+    return False, 'WhatsApp delivery is not enabled in the real-data-only build.'
+
+def _send_web_push(user_id, title, body):
+    con=db(); rows=con.execute('SELECT endpoint,p256dh,auth FROM push_subscriptions WHERE user_id=?',(user_id,)).fetchall(); con.close()
+    if not rows: return False, 'No browser push subscription.'
     try:
-        import requests
-        r=requests.post(url, json={'action':'send_whatsapp','to':number,'body':body}, timeout=20)
-        if 200 <= r.status_code < 300:
+        from pywebpush import webpush, WebPushException
+        private=os.environ.get('VAPID_PRIVATE_KEY','').strip(); claims=os.environ.get('VAPID_CLAIMS_EMAIL','').strip()
+        if not private or not claims: return False, 'VAPID credentials are not configured.'
+        sent=False
+        for r in rows:
             try:
-                out=r.json()
-                return bool(out.get('ok')), out.get('error') or ('sent via Google Apps Script' if out.get('ok') else 'WhatsApp send failed')
-            except Exception:
-                return True, 'sent via Google Apps Script'
-        return False, f'WhatsApp bridge HTTP {r.status_code}'
-    except Exception as exc:
-        return False, str(exc)
+                webpush(subscription_info={'endpoint':r['endpoint'],'keys':{'p256dh':r['p256dh'],'auth':r['auth']}},data=json.dumps({'title':title,'body':body}),vapid_private_key=private,vapid_claims={'sub':claims})
+                sent=True
+            except WebPushException as exc:
+                if getattr(exc,'response',None) is not None and exc.response.status_code in (404,410):
+                    con=db(); con.execute('DELETE FROM push_subscriptions WHERE endpoint=?',(r['endpoint'],)); con.commit(); con.close()
+        return sent, 'sent via browser push' if sent else 'browser push failed'
+    except Exception as exc: return False, str(exc)
 
 def _user_event_sent(user_id,event_type,event_key):
     con=db(); row=con.execute('SELECT 1 FROM alert_events WHERE user_id=? AND event_type=? AND event_key=?',(user_id,event_type,event_key)).fetchone(); con.close(); return bool(row)
@@ -153,6 +119,7 @@ def _set_alert_state(user_id, **fields):
 
 def _message_for(z,lang,kind):
     risk=z['risk']; district=z['district']; current=z['current']; danger=z['danger']; trend=z['trend_3h_cm']; predicted=z['predicted']
+    if risk=='UNAVAILABLE' or current is None: return f'FloodGuard BD — Authentic BWDB data is currently unavailable for {district}. No artificial values are substituted. Follow official BWDB/FFWC updates.'
     direction='rising' if trend>0.2 else ('falling' if trend<-0.2 else 'stable')
     if lang=='bn':
         if kind=='welcome': return f"FloodGuard BD\nআপনার {district} zone-এর flood alert চালু হয়েছে। বর্তমান ঝুঁকি: {risk_label_bn(risk)}।"
@@ -172,8 +139,8 @@ def _dispatch_user_event(row, event_type, event_key, kind, z):
     sent=False; details=[]
     if row['email_alerts'] and row['alerts']:
         ok,detail=_send_email(row['email'],subject,body); details.append('email:'+('sent' if ok else detail)); sent=sent or ok
-    if row['whatsapp_alerts'] and row['alerts'] and row['whatsapp']:
-        ok,detail=_send_whatsapp(row['whatsapp'],body); details.append('whatsapp:'+('sent' if ok else detail)); sent=sent or ok
+    if row['alerts']:
+        ok,detail=_send_web_push(row['id'],subject,body); details.append('web:'+('sent' if ok else detail)); sent=sent or ok
     if sent: _mark_event(row['id'],event_type,event_key)
     return {'sent':sent,'details':details}
 
@@ -183,6 +150,8 @@ def dispatch_alerts():
     for row in users:
         try:
             z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+            if z.get('risk')=='UNAVAILABLE':
+                results.append({'sent':False,'skipped':'authentic_data_unavailable','zone':z.get('id')}); continue
             state=_get_alert_state(row['id'])
             # First run after enabling alerts: welcome + initialize state.
             if not state or not state['welcome_sent']:
@@ -221,7 +190,7 @@ def _live_worker():
     try:
         with _cache_lock:
             LIVE_CACHE['state']='syncing'; LIVE_CACHE['last_attempt']=datetime.now(timezone.utc).isoformat()
-        payload=fetch_ffwc_current()
+        payload=fetch_ffwc_current(STATIONS)
         with _cache_lock:
             LIVE_CACHE.update(payload=payload, expires=time.time()+CACHE_SECONDS, error=None, state='connected')
     except Exception as exc:
@@ -262,47 +231,25 @@ def live_for_station(key):
     st=STATIONS[key]; snap=live_snapshot(); data=snap.get('data',{})
     target=(norm(st['river']),norm(st['station']))
     hit=data.get(target)
-    if hit: return {**hit,'live':True}
+    if hit: return {**hit,'live':True,'simulation':False}
     for (river,station),v in data.items():
-        if station==norm(st['station']) or (station in norm(st['station']) or norm(st['station']) in station):
-            return {**v,'live':True}
-    snaprow=FFWC_BULLETIN_SNAPSHOT.get(key)
-    if snaprow:
-        return {**snaprow,'live':False,'snapshot':True,'source_url':'https://ffwc.gov.bd/app/daily-waterlevel-report'}
-    return simulated_current(key)
+        if station==norm(st['station']) or station in norm(st['station']) or norm(st['station']) in station:
+            return {**v,'live':True,'simulation':False}
+    return {'live':False,'simulation':False,'unavailable':True,'source':'BWDB Hydrology chart unavailable','source_url':'https://www.hydrology.bwdb.gov.bd/'}
 
-def simulated_current(key):
-    st=STATIONS[key]; now=datetime.now(timezone.utc); seconds=(now.hour*3600+now.minute*60+now.second)
-    day_index=(now.date()-datetime(2026,1,1).date()).days
-    phase=(day_index*0.39)+(seconds/86400)*2*math.pi
-    rng=random.Random(st['seed'])
-    trend=0.14*math.sin(phase/2.4)+0.07*math.sin(phase/5.1)
-    spike=0.0
-    if st['seed'] % 4 == 0: spike=0.45*math.sin(phase*1.7)
-    current=max(0, st['base']+st['wave']*math.sin(phase)+trend+spike)
-    return {'live':False,'simulation':True,'source':'FloodGuard simulation scenario','current':round(current,2),'danger':st['danger'],'observed_at':now.astimezone().strftime('%Y-%m-%d %H:%M:%S'),'source_url':'https://ffwc.gov.bd/app/observed-water-level'}
-
-def make_history(key, current):
-    if key=='mymensingh':
-        rows=[{'time':t,'level':v,'kind':'Project observation'} for t,v in MYMENSINGH_REAL]
-        rng=random.Random(91)
-        start=datetime.strptime(MYMENSINGH_REAL[0][0],'%Y-%m-%d %H:%M:%S')-timedelta(hours=3*90)
-        for i in range(90):
-            dt=start+timedelta(hours=3*i); val=9.65-0.022*i+0.10*math.sin(i/3)+rng.uniform(-0.03,0.03)
-            rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':round(val,2),'kind':'Historical context'})
-        rows.sort(key=lambda x:x['time'])
-        rows[-1]={'time':datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'),'level':current,'kind':'Latest available observation/model state'}
-        return rows
-    st=STATIONS[key]; rng=random.Random(st['seed']); rows=[]; now=datetime.now().astimezone().replace(minute=0,second=0,microsecond=0)
-    start=now-timedelta(hours=3*95)
-    for i in range(96):
-        dt=start+timedelta(hours=3*i); progress=i/95
-        val=st['base'] + (current-st['base'])*progress + st['wave']*math.sin(i/6)+0.06*math.sin(i/14)+rng.uniform(-0.035,0.035)
-        rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':round(val,2),'kind':'Recorded / scenario history'})
-    rows[-1]={'time':now.strftime('%Y-%m-%d %H:%M:%S'),'level':current,'kind':'Latest state'}
-    return rows
+def make_history(key, current=None):
+    st=STATIONS[key]; snap=live_snapshot(); data=snap.get('data',{}); target=(norm(st['river']),norm(st['station']))
+    hit=data.get(target)
+    if not hit:
+        for (river,station),v in data.items():
+            if station==norm(st['station']) or station in norm(st['station']) or norm(st['station']) in station:
+                hit=v; break
+    if not hit or not hit.get('history'):
+        return []
+    return hit['history']
 
 def risk_for(level,danger):
+    if level is None or danger is None: return 'UNAVAILABLE'
     r=level/danger if danger else 0
     if r>=1.02:return 'SEVERE'
     if r>=0.96:return 'FLOOD'
@@ -310,44 +257,59 @@ def risk_for(level,danger):
     return 'NORMAL'
 
 def predict_24h(history,current,danger):
-    if len(history)>=4:
-        recent=[x['level'] for x in history[-5:]]; slope=(recent[-1]-recent[0])/4
-    else:slope=0
-    predicted=max(0,current+slope*8)
-    probability=max(2,min(98,round(100/(1+math.exp(-((predicted/danger)-.86)*18)))))
-    return round(predicted,2),probability,risk_for(predicted,danger),round(slope,4)
+    if current is None or danger is None or len(history)<4:
+        return None,None,'UNAVAILABLE',None
+    levels=[float(x['level']) for x in history[-4:]]
+    hyd={'water_level':levels[-1],'water_level_6h_ago':levels[-2],'water_level_12h_ago':levels[-3],'water_level_24h_ago':levels[-4]}
+    out=predict_flood(hyd,{},danger)
+    pred=out.get('predicted_water_level_24h'); risk=out.get('risk','UNAVAILABLE')
+    slope=(levels[-1]-levels[-2])
+    return pred,None,risk,round(slope,4)
 
-def forecast_15_days(current,slope,danger,key):
-    # Stable all-zone 15-day projection; deterministic per zone and anchored to current state.
-    today=datetime.now().astimezone(); out=[]; st=STATIONS[key]
-    rng=random.Random(st['seed']*17)
+def forecast_15_days(history,danger,key):
+    """Recursive forecast using only the real-data-trained model. If model is unavailable, return no forecast."""
+    if len(history)<4 or not model_status().get('ready'): return []
+    levels=[float(x['level']) for x in history[-4:]]; out=[]
+    today=datetime.now().astimezone()
     for day in range(1,16):
-        decay=0.92**(day-1)
-        cyc=0.08*math.sin((day+st['seed'])/2.2)
-        event=0.04*math.sin(day/1.8+st['seed'])
-        level=max(0,current + slope*8*day*decay + cyc + event)
-        # Clamp into a sensible range around the danger reference.
-        level=min(level, danger*1.18); level=max(level, 0.05)
-        prob=max(1,min(99,round(100/(1+math.exp(-((level/danger)-.86)*18)))))
-        uncertainty=round(0.05+day*0.012,2)
-        out.append({'date':(today+timedelta(days=day)).strftime('%Y-%m-%d'),'level':round(level,2),'probability':prob,'risk':risk_for(level,danger),'uncertainty':uncertainty})
+        hyd={'water_level':levels[-1],'water_level_6h_ago':levels[-2],'water_level_12h_ago':levels[-3],'water_level_24h_ago':levels[-4]}
+        pred=predict_flood(hyd,{},danger)
+        level=pred.get('predicted_water_level_24h')
+        if level is None: return []
+        risk=risk_for(level,danger)
+        out.append({'date':(today+timedelta(days=day)).strftime('%Y-%m-%d'),'level':round(level,2),'probability':None,'risk':risk,'uncertainty':None,'model':pred.get('model'),'source':'Real-data-trained model'})
+        levels.append(level); levels=levels[-4:]
     return out
 
 def package_station(key):
-    st=STATIONS[key]; live=live_for_station(key); current=float(live.get('current',st['base'])); danger=float(live.get('danger',st['danger']))
-    hist=make_history(key,current); pred,prob,risk,slope=predict_24h(hist,current,danger); f15=forecast_15_days(current,slope,danger,key)
-    status='LIVE' if live.get('live') else ('FFWC SNAPSHOT' if live.get('snapshot') else 'SIMULATION')
-    return {'id':key,'name':st['name'],'district':st['district'],'division':st['division'],'river':st['river'],'station':st['station'],'current':round(current,2),'predicted':pred,'probability':prob,'risk':risk,'danger':round(danger,2),'lat':st['lat'],'lon':st['lon'],'trend_3h_cm':round(slope*100,1),'live':bool(live.get('live')),'simulation':bool(live.get('simulation')),'snapshot':bool(live.get('snapshot')),'status':status,'source':live.get('source','FFWC'),'source_url':live.get('source_url'),'observed_at':live.get('observed_at'),'fetched_at':live_snapshot().get('fetched_at'),'forecast15':f15,'day15':f15[-1]['level'],'day15risk':f15[-1]['risk']}
+    st=STATIONS[key]; live=live_for_station(key)
+    current=live.get('current'); danger=live.get('danger') or st.get('danger')
+    hist=make_history(key,current)
+    pred,prob,risk,slope=predict_24h(hist,current,danger)
+    if risk=='UNAVAILABLE' and current is not None:
+        risk=risk_for(current,danger)
+    f15=forecast_15_days(hist,danger,key)
+    status='LIVE BWDB' if live.get('live') else 'DATA UNAVAILABLE'
+    return {'id':key,'name':st['name'],'district':st['district'],'division':st['division'],'river':st['river'],'station':st['station'],
+            'current':round(float(current),2) if current is not None else None,'predicted':pred,'probability':prob,'risk':risk,
+            'danger':round(float(danger),2) if danger is not None else None,'lat':st['lat'],'lon':st['lon'],
+            'trend_3h_cm':round(slope*100,1) if slope is not None else None,'live':bool(live.get('live')),'simulation':False,
+            'snapshot':False,'status':status,'source':live.get('source'),'source_url':live.get('source_url'),
+            'observed_at':live.get('observed_at'),'fetched_at':live_snapshot().get('fetched_at'),'forecast15':f15,
+            'day15':f15[-1]['level'] if f15 else None,'day15risk':f15[-1]['risk'] if f15 else 'UNAVAILABLE',
+            'history_points':len(hist),'model_ready':bool(model_status().get('ready'))}
 
 def build_dashboard(key):
     if key not in STATIONS:key='mymensingh'
     z=package_station(key); hist=make_history(key,z['current'])
     pred,prob,risk,slope=predict_24h(hist,z['current'],z['danger'])
-    risk_now=z['risk']
-    simple=make_simple_summary(z)
-    return {'station':z,'current':z['current'],'predicted':pred,'probability':prob,'risk':risk_now,'trend_per_3h':slope,'forecast15':z['forecast15'],'history':hist,'advice':advice(risk_now),'simple':simple,'live_connected':bool(z['live'])}
+    if risk=='UNAVAILABLE' and z['current'] is not None:risk=risk_for(z['current'],z['danger'])
+    return {'station':z,'current':z['current'],'predicted':pred,'probability':prob,'risk':risk,'trend_per_3h':slope,
+            'forecast15':z['forecast15'],'history':hist,'advice':advice(risk),'simple':make_simple_summary(z),
+            'live_connected':bool(z['live']),'model':model_status()}
 
 def advice(risk):
+    if risk=='UNAVAILABLE': return ['Authentic BWDB observation data is currently unavailable for this zone.','No model forecast is shown until real source data is available.','Follow official BWDB/FFWC information for decisions.']
     return {
       'NORMAL':['Monitor official updates.','Keep phones and power banks charged.','Know the nearest safe high ground or shelter.'],
       'WARNING':['Check official and local-authority updates regularly.','Prepare water, dry food, medicines and important documents.','Move valuables and electrical items higher and plan an evacuation route.'],
@@ -356,7 +318,8 @@ def advice(risk):
     }[risk]
 
 def make_simple_summary(z):
-    gap=z['danger']-z['current']; direction='rising' if z['trend_3h_cm']>0.2 else ('falling' if z['trend_3h_cm']<-0.2 else 'fairly steady')
+    if z['current'] is None or z['danger'] is None: return {'headline':'Authentic source data is currently unavailable for this zone.','sub':'FloodGuard will not substitute simulated or synthetic values.'}
+    gap=z['danger']-z['current']; direction='rising' if (z['trend_3h_cm'] or 0)>0.2 else ('falling' if (z['trend_3h_cm'] or 0)<-0.2 else 'fairly steady')
     if z['risk']=='SEVERE': headline=f"Severe flood risk near {z['district']}. Water level is {direction} and needs immediate attention."
     elif z['risk']=='FLOOD': headline=f"Flood conditions are possible in {z['district']}. Water level is {direction}; keep essentials ready."
     elif z['risk']=='WARNING': headline=f"Flood risk is increasing in {z['district']}. Water level is {direction}; stay alert."
@@ -391,6 +354,23 @@ def live_status():
 def analytics():
     zones=[package_station(k) for k in STATIONS]; rising=sorted(zones,key=lambda z:z['trend_3h_cm'],reverse=True); close=sorted(zones,key=lambda z:z['current']/z['danger'],reverse=True)
     return jsonify({'counts':{r:sum(z['risk']==r for z in zones) for r in ['NORMAL','WARNING','FLOOD','SEVERE']},'avg_level':round(statistics.mean(z['current'] for z in zones),2),'rising':rising[:6],'closest':close[:6]})
+
+@app.get('/api/model-status')
+def api_model_status(): return jsonify(model_status())
+
+@app.get('/api/data-provenance')
+def data_provenance():
+    from real_data import source_status
+    return jsonify(source_status())
+
+@app.get('/api/glofas/<station_id>')
+def glofas_station(station_id):
+    if station_id not in STATIONS: return jsonify({'ok':False,'error':'Unknown station'}),404
+    try:
+        from live_data import fetch_glofas_forecast
+        return jsonify(fetch_glofas_forecast({**STATIONS[station_id],'id':station_id}))
+    except Exception as exc:
+        return jsonify({'ok':False,'error':str(exc),'source':'Copernicus GloFAS'}),503
 
 @app.get('/api/hazards/earthquakes')
 def earthquakes():
@@ -538,9 +518,54 @@ def cyclones():
 @app.route('/api/report')
 def report():
     zones=[package_station(k) for k in STATIONS]; now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
-    lines=['FLOODGUARD BD — FLOOD SITUATION REPORT','',f'Generated: {now}','Data states are labelled as Live, FFWC Snapshot, or Simulation.','']
+    lines=['FLOODGUARD BD — FLOOD SITUATION REPORT','',f'Generated: {now}','Only authentic source observations and real-data-trained model outputs are reported.','']
     for z in zones: lines.append(f"{z['name']} | {z['current']:.2f} m | ref {z['danger']:.2f} m | {z['risk']} | {z['status']}")
     return Response('\n'.join(lines),mimetype='text/plain',headers={'Content-Disposition':'attachment; filename="FloodGuard_BD_Situation_Report.txt"'})
+
+@app.post('/api/copilot')
+def copilot():
+    data=request.get_json(silent=True) or {}
+    question=(data.get('question') or '').strip()
+    station=data.get('station') or 'mymensingh'
+    if not question: return jsonify({'ok':False,'error':'Question is required.'}),400
+    if station not in STATIONS: station='mymensingh'
+    key=os.environ.get('GEMINI_API_KEY','').strip()
+    if not key: return jsonify({'ok':False,'error':'GEMINI_API_KEY is not configured.'}),503
+    z=package_station(station)
+    if not z.get('live'):
+        return jsonify({'ok':False,'error':'Authentic BWDB observation data is unavailable for this zone; Copilot will not invent context.'}),503
+    prompt=("You are FloodGuard BD Copilot. Use ONLY the supplied FloodGuard data. "
+            "Do not invent measurements, forecasts, warnings, authorities or sources. "
+            "Clearly distinguish BWDB observed water level from model projection and GloFAS forecast. "
+            "Give concise, safety-conscious decision support and tell the user to follow official BWDB/FFWC instructions.\n\n"
+            f"Station data: {json.dumps(z,ensure_ascii=False)}\nUser question: {question}")
+    try:
+        import requests
+        url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'
+        r=requests.post(url,params={'key':key},json={'contents':[{'parts':[{'text':prompt}]}]},timeout=20)
+        r.raise_for_status(); j=r.json()
+        text=((j.get('candidates') or [{}])[0].get('content') or {}).get('parts') or []
+        answer=''.join(p.get('text','') for p in text).strip()
+        if not answer: raise RuntimeError('Gemini returned an empty response')
+        return jsonify({'ok':True,'answer':answer,'model':'gemini-2.5-flash','grounded_in':'FloodGuard real source data'})
+    except Exception as exc:
+        return jsonify({'ok':False,'error':str(exc)}),502
+
+@app.get('/api/push/public-key')
+def push_public_key():
+    key=os.environ.get('VAPID_PUBLIC_KEY','').strip()
+    if not key:return jsonify({'ok':False,'error':'VAPID_PUBLIC_KEY is not configured.'}),503
+    return jsonify({'ok':True,'public_key':key})
+
+@app.post('/api/push/subscribe')
+def push_subscribe():
+    uid=session.get('uid')
+    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
+    data=request.get_json(silent=True) or {}; sub=data.get('subscription') or {}
+    endpoint=sub.get('endpoint'); keys=sub.get('keys') or {}; p256dh=keys.get('p256dh'); auth=keys.get('auth')
+    if not endpoint or not p256dh or not auth:return jsonify({'ok':False,'error':'Invalid browser push subscription.'}),400
+    now=datetime.now(timezone.utc).isoformat(); con=db(); con.execute('INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,updated_at=excluded.updated_at',(uid,endpoint,p256dh,auth,now,now)); con.commit(); con.close()
+    return jsonify({'ok':True})
 
 # --- Auth + WhatsApp notification settings. Actual delivery requires provider credentials. ---
 @app.post('/api/auth/register')

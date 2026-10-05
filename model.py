@@ -1,53 +1,54 @@
+"""Production model interface. No synthetic fallback is permitted."""
 from pathlib import Path
+from datetime import datetime, timezone
+import json
 import joblib
 import numpy as np
 
-MODEL_PATH = Path("model/flood_model.joblib")
+MODEL_PATH = Path("model/real_flood_model.joblib")
+META_PATH = Path("model/real_flood_model.json")
 
-def _fallback_prediction(hyd, weather, danger):
-    current = hyd["water_level"]
-    slope_24h = current - hyd["water_level_24h_ago"]
-    rain_effect = min(weather["rain_next_24h_mm"] / 500.0, 0.35)
-    upstream_effect = min(max(hyd["upstream_change"], 0) * 0.5, 0.25)
-    predicted = current + slope_24h + rain_effect + upstream_effect
-    probability = 1 / (1 + np.exp(-(predicted - danger) * 3.0))
-    return predicted, float(np.clip(probability, 0.02, 0.98)), "Trend + rainfall fallback"
+FEATURES = ["water_level", "water_level_6h_ago", "water_level_12h_ago", "water_level_24h_ago"]
+
+
+def model_status():
+    if not MODEL_PATH.exists():
+        return {"ready": False, "reason": "REAL_MODEL_NOT_TRAINED", "path": str(MODEL_PATH)}
+    try:
+        meta=json.loads(META_PATH.read_text()) if META_PATH.exists() else {}
+        return {"ready": True, "path": str(MODEL_PATH), **meta}
+    except Exception as exc:
+        return {"ready": False, "reason": f"MODEL_METADATA_ERROR: {exc}"}
+
 
 def predict_flood(hyd, weather, danger):
-    x = np.array([[
-        hyd["water_level"], hyd["water_level_6h_ago"],
-        hyd["water_level_12h_ago"], hyd["water_level_24h_ago"],
-        weather["rain_now_mm"], weather["rain_next_24h_mm"],
-        hyd["upstream_level"], hyd["upstream_change"],
-        weather["temperature_c"] if weather["temperature_c"] is not None else 28.0
-    ]], dtype=float)
-
-    if MODEL_PATH.exists():
-        try:
-            model = joblib.load(MODEL_PATH)
-            predicted = float(model.predict(x)[0])
-            probability = float(np.clip(1 / (1 + np.exp(-(predicted-danger)*3)), 0.01, 0.99))
-            method = "Trained Random Forest"
-        except Exception:
-            predicted, probability, method = _fallback_prediction(hyd, weather, danger)
-    else:
-        predicted, probability, method = _fallback_prediction(hyd, weather, danger)
-
-    if predicted >= danger + 1.0:
-        risk = "SEVERE"
-    elif predicted >= danger:
-        risk = "FLOOD"
-    elif predicted >= danger - 0.5:
-        risk = "WARNING"
-    else:
-        risk = "NORMAL"
-
-    from datetime import datetime, timezone
+    status=model_status()
+    if not status["ready"]:
+        return {
+            "ready": False,
+            "predicted_water_level_24h": None,
+            "flood_probability": None,
+            "risk": "UNAVAILABLE",
+            "model": "No real-data-trained model available",
+            "danger_level": danger,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "reason": status.get("reason"),
+        }
+    x=np.array([[float(hyd[k]) for k in FEATURES]],dtype=float)
+    model=joblib.load(MODEL_PATH)
+    predicted=float(model.predict(x)[0])
+    # Classification is based on the official/reference danger threshold, not synthetic probabilities.
+    if predicted >= danger + 1.0: risk="SEVERE"
+    elif predicted >= danger: risk="FLOOD"
+    elif predicted >= danger - 0.5: risk="WARNING"
+    else: risk="NORMAL"
     return {
-        "predicted_water_level_24h": round(predicted, 2),
-        "flood_probability": round(probability * 100, 1),
+        "ready": True,
+        "predicted_water_level_24h": round(predicted,2),
+        "flood_probability": None,
         "risk": risk,
-        "model": method,
+        "model": status.get("model_name","Real-data-trained model"),
         "danger_level": danger,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat()
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "training_source": status.get("training_source"),
     }

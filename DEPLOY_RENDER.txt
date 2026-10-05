@@ -1,17 +1,39 @@
-FLOODGUARD BD — PUBLIC WEBSITE DEPLOYMENT
+FLOODGUARD BD — REAL-DATA DEPLOYMENT
 
-This package is prepared for Render.
+Build command:
+pip install -r requirements.txt && python train_real_model.py
 
-1. Create a GitHub account and a new PUBLIC repository named floodguard-bd.
-2. Upload ALL files/folders in this package to the repository root.
-3. On Render: New + > Web Service > connect the GitHub repository.
-4. Build Command: pip install -r requirements.txt
-5. Start Command: gunicorn app:app
-6. Deploy. Render will give you a public https://...onrender.com URL.
-7. Open the URL from any phone, laptop, or other device.
+Start command:
+gunicorn --bind 0.0.0.0:$PORT app:app
 
-Optional custom domain:
-Buy a domain later and add it from Render.
+Required Render environment variables:
+SECRET_KEY=<long random secret>
+CDS_API_KEY=<private Copernicus EWDS personal access token>
+CDS_API_URL=https://ewds.climate.copernicus.eu/api
+GEMINI_API_KEY=<private Gemini API key>
+SMTP_HOST=<SMTP server>
+SMTP_PORT=587
+SMTP_USER=<SMTP username>
+SMTP_PASS=<SMTP password>
+EMAIL_FROM=<verified sender address>
+SMTP_TLS=true
+VAPID_PUBLIC_KEY=<Web Push public key>
+VAPID_PRIVATE_KEY=<Web Push private key>
+VAPID_CLAIMS_EMAIL=mailto:<contact email>
 
-IMPORTANT:
-The dashboard should label source status accurately. Do not describe fallback/reference data as FFWC live data.
+Optional:
+LIVE_REFRESH_SECONDS=300
+ALERT_CHECK_SECONDS=300
+SOURCE_HTTP_TIMEOUT=25
+REAL_MODEL_MIN_ROWS=100
+
+Important:
+- Do not put secrets in source files.
+- No synthetic/demo fallback exists in the production data path.
+- If authentic BWDB data cannot be fetched, the application reports DATA UNAVAILABLE.
+- The real model must be trained before AI forecast output becomes available.
+
+Train the real model after deployment or as a controlled build step:
+python train_real_model.py
+
+Training aborts rather than generating artificial rows if BWDB chart observations are insufficient.
